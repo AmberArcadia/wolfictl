@@ -5,7 +5,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
@@ -21,8 +20,9 @@ import (
 )
 
 func cmdSVG() *cobra.Command { //nolint:gocyclo
-	var dir, pipelineDir string
-	var showDependents, recursive, span, web bool
+	var dirs []string
+	var pipelineDir string
+	var showDependents, recursive, span, web, skipFailures bool
 	var extraKeys, extraRepos []string
 	d := &cobra.Command{
 		Use:   "dot",
@@ -47,19 +47,29 @@ Open browser to explore crane's deps recursively, only showing a minimum subgrap
 `,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
-			if pipelineDir == "" {
-				pipelineDir = filepath.Join(dir, "pipelines")
+			if len(dirs) == 0 {
+				dirs = []string{"."}
+			}
+			// Don't set a global pipelineDir when using multiple directories
+			// Let each directory use its own pipelines subdirectory
+			if len(dirs) == 1 && pipelineDir == "" {
+				pipelineDir = filepath.Join(dirs[0], "pipelines")
 			}
 
-			pkgs, err := dag.NewPackages(ctx, os.DirFS(dir), dir, pipelineDir)
+			pkgs, err := dag.NewPackagesFromDirs(ctx, dirs, pipelineDir, skipFailures)
 			if err != nil {
-				return fmt.Errorf("NewPackages: %w", err)
+				return fmt.Errorf("NewPackagesFromDirs: %w", err)
 			}
 
-			g, err := dag.NewGraph(ctx, pkgs,
+			graphOptions := []dag.GraphOptions{
 				dag.WithKeys(extraKeys...),
 				dag.WithRepos(extraRepos...),
-			)
+			}
+			if skipFailures {
+				graphOptions = append(graphOptions, dag.WithAllowUnresolved())
+			}
+			
+			g, err := dag.NewGraph(ctx, pkgs, graphOptions...)
 			if err != nil {
 				return fmt.Errorf("building graph: %w", err)
 			}
@@ -297,11 +307,12 @@ Open browser to explore crane's deps recursively, only showing a minimum subgrap
 			return nil
 		},
 	}
-	d.Flags().StringVarP(&dir, "dir", "d", ".", "directory to search for melange configs")
+	d.Flags().StringSliceVarP(&dirs, "dir", "d", []string{"."}, "directories to search for melange configs")
 	d.Flags().StringVar(&pipelineDir, "pipeline-dir", "", "directory used to extend defined built-in pipelines")
 	d.Flags().BoolVarP(&showDependents, "show-dependents", "D", false, "show packages that depend on these packages, instead of these packages' dependencies")
 	d.Flags().BoolVarP(&recursive, "recursive", "R", false, "recurse through package dependencies")
 	d.Flags().BoolVarP(&span, "spanning-tree", "S", false, "does something like a spanning tree to avoid a huge number of edges")
+	d.Flags().BoolVar(&skipFailures, "skip-failures", false, "skip dependency resolution failures and continue generating the graph")
 	d.Flags().StringSliceVarP(&extraKeys, "keyring-append", "k", []string{"https://packages.wolfi.dev/os/wolfi-signing.rsa.pub"}, "path to extra keys to include in the build environment keyring")
 	d.Flags().StringSliceVarP(&extraRepos, "repository-append", "r", []string{"https://packages.wolfi.dev/os"}, "path to extra repositories to include in the build environment")
 	d.Flags().BoolVar(&web, "web", false, "do a website")

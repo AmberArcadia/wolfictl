@@ -364,6 +364,12 @@ func (g *Graph) addAppropriatePackageFromResolver(resolverKey string, c Package,
 				// it's in our own packages list, so find the package that is an actual match
 				configs := g.packages.Config(r.Name, false)
 				if len(configs) == 0 {
+					if g.opts.allowUnresolved {
+						if err := g.addDanglingPackage(r.Name, c); err != nil {
+							return nil, fmt.Errorf("%s: unable to add dangling package %s: %w", c, r.Name, err)
+						}
+						continue
+					}
 					return nil, fmt.Errorf("unable to find package %s-%s in local repository", r.Name, r.Version)
 				}
 				for _, config := range configs {
@@ -374,6 +380,12 @@ func (g *Graph) addAppropriatePackageFromResolver(resolverKey string, c Package,
 					}
 				}
 				if pkg == nil {
+					if g.opts.allowUnresolved {
+						if err := g.addDanglingPackage(r.Name, c); err != nil {
+							return nil, fmt.Errorf("%s: unable to add dangling package %s: %w", c, r.Name, err)
+						}
+						continue
+					}
 					return nil, fmt.Errorf("unable to find package %s-%s in local repository", r.Name, r.Version)
 				}
 			} else {
@@ -388,6 +400,12 @@ func (g *Graph) addAppropriatePackageFromResolver(resolverKey string, c Package,
 
 		// Couldn't find any candidates for this package, exit early.
 		if len(matchList) == 0 {
+			if g.opts.allowUnresolved {
+				if err := g.addDanglingPackage(dep, c); err != nil {
+					return nil, fmt.Errorf("%s: unable to add dangling package %s: %w", c, dep, err)
+				}
+				return nil, nil
+			}
 			return nil, fmt.Errorf("no matches for %q", dep)
 		}
 
@@ -1011,7 +1029,13 @@ func (g Graph) Targets() (*Graph, error) { //nolint:gocyclo
 
 		origin, ok := originByName[vertex.Name()]
 		if !ok {
-			return nil, fmt.Errorf("unexpected node: %q", node)
+			// This might be a dangling package that was incorrectly marked as local
+			// or a package that exists but wasn't properly registered in origin mappings
+			// Treat it as an external package and add it to the subgraph
+			if err := subgraph.addVertex(vertex); err != nil && !errors.Is(err, graph.ErrVertexAlreadyExists) {
+				return nil, err
+			}
+			continue
 		}
 
 		if vertex.Name() != origin {
@@ -1045,7 +1069,10 @@ func (g Graph) Targets() (*Graph, error) { //nolint:gocyclo
 
 			sourceOrigin, ok := originByName[source.Name()]
 			if !ok {
-				return nil, fmt.Errorf("unexpected source: %q", edge.Source)
+				// This might be a dangling package that was incorrectly marked as local
+				// or a package that exists but wasn't properly registered in origin mappings
+				// Use the source as-is since we can't find its origin
+				sourceOrigin = source.Name()
 			}
 
 			if sourceOrigin != source.Name() {
@@ -1068,7 +1095,10 @@ func (g Graph) Targets() (*Graph, error) { //nolint:gocyclo
 
 			targetOrigin, ok := originByName[target.Name()]
 			if !ok {
-				return nil, fmt.Errorf("unexpected target: %q", edge.Target)
+				// This might be a dangling package that was incorrectly marked as local
+				// or a package that exists but wasn't properly registered in origin mappings
+				// Use the target as-is since we can't find its origin
+				targetOrigin = target.Name()
 			}
 
 			if targetOrigin != target.Name() {

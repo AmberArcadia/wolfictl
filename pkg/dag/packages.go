@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -262,6 +263,176 @@ func NewPackages(ctx context.Context, fsys fs.FS, dirPath, pipelineDir string) (
 	}
 
 	return pkgs, nil
+}
+
+// NewPackagesWithOptions creates a new Packages object with options for error handling.
+// If skipFailures is true, it will skip individual packages that fail to compile.
+func NewPackagesWithOptions(ctx context.Context, fsys fs.FS, dirPath, pipelineDir string, skipFailures bool) (*Packages, error) {
+	log := clog.FromContext(ctx)
+
+	pkgs := &Packages{
+		configs:  make(map[string][]*Configuration),
+		packages: make(map[string][]*Configuration),
+		index:    make(map[string]*Configuration),
+	}
+
+	var g errgroup.Group
+	g.SetLimit(runtime.GOMAXPROCS(0))
+	err := fs.WalkDir(fsys, ".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		// Skip anything in .github/ and .git/
+		if path == ".github" {
+			return fs.SkipDir
+		}
+		if path == ".git" {
+			return fs.SkipDir
+		}
+
+		// .yam.yaml, .melange.k8s.yaml, .golangci.yaml, .pre-commit-config.yaml, etc.
+		if d.Type().IsRegular() && strings.HasPrefix(filepath.Base(path), ".") {
+			return nil
+		}
+
+		// Skip any file that isn't a yaml file
+		if !d.Type().IsRegular() || !strings.HasSuffix(path, ".yaml") {
+			return nil
+		}
+
+		if filepath.Dir(path) != "." && !strings.HasSuffix(path, ".melange.yaml") {
+			log.With("path", path).Debug("skipping non-melange YAML file")
+			return nil
+		}
+
+		g.Go(func() error {
+			c, err := config.ParseConfiguration(ctx, filepath.Join(dirPath, path))
+			if err != nil {
+				if skipFailures {
+					log.With("path", path, "error", err).Warn("skipping package due to parse failure")
+					return nil
+				}
+				return fmt.Errorf("parsing %s: %w", path, err)
+			}
+
+			cfg := &Configuration{
+				Configuration: c,
+				Path:          path,
+				name:          c.Package.Name,
+				version:       fmt.Sprintf("%s-r%d", c.Package.Version, c.Package.Epoch),
+				pkg:           c.Package.Name,
+			}
+
+			// Resolve all `uses` used by the pipeline. This updates the set of
+			// .environment.contents.packages so the next block can include those as build deps.
+			build := &build.Build{
+				PipelineDirs:  []string{pipelineDir},
+				Configuration: c,
+			}
+			if err := build.Compile(ctx); err != nil {
+				if skipFailures {
+					log.With("path", path, "error", err).Warn("skipping package due to build compilation failure")
+					return nil
+				}
+				return fmt.Errorf("compiling build: %w", err)
+			}
+			cfg.Environment.Contents.Packages = build.Configuration.Environment.Contents.Packages
+
+			if err := pkgs.addPackage(cfg.name, cfg); err != nil {
+				if skipFailures {
+					log.With("path", path, "package", cfg.name, "error", err).Warn("skipping package due to add failure")
+					return nil
+				}
+				return fmt.Errorf("adding package %s: %w", cfg.name, err)
+			}
+
+			for _, sub := range c.Subpackages {
+				scfg := &Configuration{
+					Configuration: c,
+					Path:          path,
+					name:          sub.Name,
+					version:       fmt.Sprintf("%s-r%d", c.Package.Version, c.Package.Epoch),
+					pkg:           sub.Name,
+				}
+
+				if err := pkgs.addPackage(scfg.name, scfg); err != nil {
+					if skipFailures {
+						log.With("path", path, "subpackage", scfg.name, "error", err).Warn("skipping subpackage due to add failure")
+						continue
+					}
+					return fmt.Errorf("adding subpackage %s: %w", scfg.name, err)
+				}
+			}
+
+			return nil
+		})
+
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("walking filesystem: %w", err)
+	}
+
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	return pkgs, nil
+}
+
+// NewPackagesFromDirs creates a new Packages object from multiple directories.
+// It processes each directory using NewPackages and merges the results.
+// If skipFailures is true, it will continue processing even if some individual packages fail.
+func NewPackagesFromDirs(ctx context.Context, dirPaths []string, pipelineDir string, skipFailures bool) (*Packages, error) {
+	finalPkgs := &Packages{
+		configs:  make(map[string][]*Configuration),
+		packages: make(map[string][]*Configuration),
+		index:    make(map[string]*Configuration),
+	}
+
+	for _, dirPath := range dirPaths {
+		// Each directory has its own pipelines subdirectory
+		dirPipelineDir := pipelineDir
+		if dirPipelineDir == "" {
+			dirPipelineDir = filepath.Join(dirPath, "pipelines")
+		}
+		
+		pkgs, err := NewPackagesWithOptions(ctx, os.DirFS(dirPath), dirPath, dirPipelineDir, skipFailures)
+		if err != nil {
+			return nil, fmt.Errorf("processing directory %s: %w", dirPath, err)
+		}
+
+		// Merge packages from this directory into finalPkgs
+		if err := finalPkgs.mergePackages(pkgs); err != nil {
+			return nil, fmt.Errorf("merging packages from %s: %w", dirPath, err)
+		}
+	}
+
+	return finalPkgs, nil
+}
+
+// mergePackages merges another Packages object into this one
+func (p *Packages) mergePackages(other *Packages) error {
+	p.Lock()
+	defer p.Unlock()
+
+	// Merge configs
+	for name, configs := range other.configs {
+		p.configs[name] = append(p.configs[name], configs...)
+	}
+
+	// Merge packages
+	for name, packages := range other.packages {
+		p.packages[name] = append(p.packages[name], packages...)
+	}
+
+	// Merge index (last one wins for duplicates)
+	for name, config := range other.index {
+		p.index[name] = config
+	}
+
+	return nil
 }
 
 // Config returns the Melange configuration for the package, provides or
